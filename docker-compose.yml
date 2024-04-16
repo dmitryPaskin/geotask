@@ -1,4 +1,3 @@
-# 2 service: golang api and redis
 version: '3.7'
 services:
   api:
@@ -8,7 +7,7 @@ services:
       - 3080:${SERVER_PORT}
     restart: always
     networks:
-        - skynet
+      - skynet
     depends_on:
       - redis
     environment:
@@ -24,7 +23,9 @@ services:
       - skynet
     ports:
       - "127.0.0.1:6379:6379"
+
 networks:
   skynet:
-    external:
-      name: skynet
+    external: true
+    name: skynet
+    driver: bridge

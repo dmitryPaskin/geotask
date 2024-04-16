@@ -39,7 +39,7 @@ func (a *App) Run() error {
 	defer cancel()
 
 	// проверка доступности redis
-	_, err := rclient.Ping(ctx).Result()
+	_, err := rclient.Ping().Result()
 	if err != nil {
 		return err
 	}
@@ -55,10 +55,10 @@ func (a *App) Run() error {
 	orderService := oservice.NewOrderService(orderStorage, allowedZone, disAllowedZones)
 
 	orderGenerator := order.NewOrderGenerator(orderService)
-	orderGenerator.Run()
+	orderGenerator.Run(ctx)
 
 	oldOrderCleaner := order.NewOrderCleaner(orderService)
-	oldOrderCleaner.Run()
+	oldOrderCleaner.Run(ctx)
 
 	// инициализация хранилища курьеров
 	courierStorage := cstorage.NewCourierStorage(rclient)

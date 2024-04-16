@@ -3,8 +3,11 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"github.com/go-redis/redis"
 	"gitlab.com/ptflp/geotask/module/order/models"
+	"strconv"
 	"time"
 )
 
@@ -27,7 +30,28 @@ func NewOrderStorage(storage *redis.Client) OrderStorager {
 
 func (o *OrderStorage) Save(ctx context.Context, order models.Order, maxAge time.Duration) error {
 	// save with geo redis
-	return o.saveOrderWithGeo(ctx, order, maxAge)
+	if order.ID == 0 {
+		return errors.New("ID is zero")
+	}
+	orderJSON, err := json.Marshal(order)
+	if err != nil {
+		return err
+	}
+
+	if err := o.storage.Set(fmt.Sprintf("order:%d", order.ID), string(orderJSON), maxAge).Err(); err != nil {
+		return err
+	}
+
+	orderGEOAddCmd := o.storage.GeoAdd("orders", &redis.GeoLocation{
+		Name:      fmt.Sprintf("order:%d", order.ID),
+		Longitude: order.Lng,
+		Latitude:  order.Lat,
+	})
+
+	if orderGEOAddCmd.Err() != nil {
+		return orderGEOAddCmd.Err()
+	}
+	return nil
 }
 
 func (o *OrderStorage) RemoveOldOrders(ctx context.Context, maxAge time.Duration) error {
@@ -45,42 +69,66 @@ func (o *OrderStorage) RemoveOldOrders(ctx context.Context, maxAge time.Duration
 	// Проверить количество старых ордеров
 	// удалить старые ордеры из redis используя метод ZRemRangeByScore где ключ "orders" min "-inf" max "(время создания старого ордера)"
 	// удалять ордера по ключу не нужно, они будут удалены автоматически по истечению времени жизни
+	maxTime := time.Now().Add(-maxAge).Unix()
+
+	oldOrderIDs, err := o.storage.ZRangeByScore("orders", redis.ZRangeBy{
+		Max: fmt.Sprintf("(%d", maxTime),
+		Min: "0",
+	}).Result()
+	if err != nil {
+		return err
+	}
+
+	if len(oldOrderIDs) == 0 {
+		return nil
+	}
+
+	var oldOrderIDsInterface []interface{}
+	for _, id := range oldOrderIDs {
+		oldOrderIDsInterface = append(oldOrderIDsInterface, id)
+	}
+
+	_, err = o.storage.ZRem("orders", oldOrderIDsInterface...).Result()
+	if err != nil {
+		return err
+	}
+
+	for _, orderID := range oldOrderIDs {
+		err = o.storage.Del(fmt.Sprintf("order:%s", orderID)).Err()
+		if err != nil {
+			fmt.Printf("failed to remove data of old order %s: %v\n", orderID, err)
+		}
+	}
 
 	return nil
 }
 
 func (o *OrderStorage) GetByID(ctx context.Context, orderID int) (*models.Order, error) {
-	var err error
-	var data []byte
-	var order models.Order
+
 	// получаем ордер из redis по ключу order:ID
 
 	// проверяем что ордер не найден исключение redis.Nil, в этом случае возвращаем nil, nil
 
 	// десериализуем ордер из json
+	data, err := o.storage.Get(fmt.Sprintf("order:%d", orderID)).Bytes()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var order models.Order
+	if err = json.Unmarshal(data, &order); err != nil {
+		return nil, err
+	}
 
 	return &order, nil
 }
 
-func (o *OrderStorage) saveOrderWithGeo(ctx context.Context, order models.Order, maxAge time.Duration) error {
-	var err error
-	var data []byte
-
-	// сериализуем ордер в json
-	data, err = json.Marshal(order)
-	// сохраняем ордер в json redis по ключу order:ID с временем жизни maxAge
-
-	// добавляем ордер в гео индекс используя метод GeoAdd где Name - это ключ ордера, а Longitude и Latitude - координаты
-
-	// zset сохраняем ордер для получения количества заказов со сложностью O(1)
-	// Score - время создания ордера
-
-	return err
-}
-
 func (o *OrderStorage) GetCount(ctx context.Context) (int, error) {
 	// получить количество ордеров в упорядоченном множестве используя метод ZCard
-	count, err := o.storage.ZCard(ctx, "orders").Result()
+	count, err := o.storage.ZCard("orders").Result()
 	if err != nil {
 		return 0, err
 	}
@@ -88,48 +136,43 @@ func (o *OrderStorage) GetCount(ctx context.Context) (int, error) {
 }
 
 func (o *OrderStorage) GetByRadius(ctx context.Context, lng, lat, radius float64, unit string) ([]models.Order, error) {
-	var err error
-	var orders []models.Order
-	var data []byte
-	var ordersLocation []redis.GeoLocation
-
-	// используем метод getOrdersByRadius для получения ID заказов в радиусе
-	ordersLocation, err = o.getOrdersByRadius(ctx, lng, lat, radius, unit)
-	// обратите внимание, что в случае отсутствия заказов в радиусе
-	// метод getOrdersByRadius должен вернуть nil, nil (при ошибке redis.Nil)
-	if err == redis.Nil {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	orders = make([]models.Order, 0, len(ordersLocation))
-	// проходим по списку ID заказов и получаем данные о заказе
-	// получаем данные о заказе по ID из redis по ключу order:ID
-
-	return orders, nil
-}
-
-func (o *OrderStorage) getOrdersByRadius(ctx context.Context, lng, lat, radius float64, unit string) ([]redis.GeoLocation, error) {
-	// в данном методе мы получаем список ордеров в радиусе от точки
-	// возвращаем список ордеров с координатами и расстоянием до точки
-	/**
-	&redis.GeoRadiusQuery{
+	ordersLocation, err := o.storage.GeoRadius("orders", lng, lat, &redis.GeoRadiusQuery{
 		Radius:      radius,
 		Unit:        unit,
 		WithCoord:   true,
 		WithDist:    true,
-		WithGeoHash: true,
+		WithGeoHash: false,
+	}).Result()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get orders by radius: %w", err)
 	}
-	*/
+
+	orders := make([]models.Order, len(ordersLocation))
+
+	for _, orderLocation := range ordersLocation {
+		orderID, err := strconv.Atoi(orderLocation.Name)
+		if err != nil {
+			fmt.Printf("failed to parse order ID: %v\n", err)
+			continue
+		}
+
+		order, err := o.GetByID(ctx, orderID)
+		if err != nil {
+			fmt.Printf("failed to get order by ID %d: %v\n", orderID, err)
+			continue
+		}
+
+		orders = append(orders, *order)
+	}
+
+	return orders, nil
 }
 
 func (o *OrderStorage) GenerateUniqueID(ctx context.Context) (int64, error) {
-	var err error
-	var id int64
-
-	// генерируем уникальный ID для ордера
-	// используем для этого redis incr по ключу order:id
-
+	id, err := o.storage.Incr("order:id").Result()
+	if err != nil {
+		return 0, err
+	}
 	return id, nil
 }
